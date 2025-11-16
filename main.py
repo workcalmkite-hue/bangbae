@@ -1,19 +1,19 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-# 🔧 여기서 열 이름만 네 시트에 맞게 바꿔주면 돼!
-DATE_COL = "날짜"
-TIME_COL = "시간대"
-GRADE_COL = "학년"
-CLASS_COL = "반"
+# 🔧 시트에 실제로 있는 열 이름에 맞춰서만 바꿔주면 돼!
+DATE_COL = "날짜"      # 예: 2025-11-16 또는 구글 시트 날짜 형식
+TIME_COL = "시간대"    # 예: "아침", "점심", "종례" 등
+GRADE_COL = "학년"     # 예: 1, 2, 3
+CLASS_COL = "반"       # 예: 1, 2, 3
 NAME_COL = "이름"
-ITEM_COL = "항목"
-SCORE_COL = "점수"   # 없으면 그냥 무시됨
-NOTE_COL = "비고"    # 없으면 그냥 무시됨
+ITEM_COL = "항목"      # 벌점 사유
+SCORE_COL = "점수"     # 선택 (없으면 자동으로 무시)
+NOTE_COL = "비고"      # 선택
 
 BASE_DISPLAY_COLS = [
     DATE_COL, TIME_COL, GRADE_COL, CLASS_COL,
@@ -26,21 +26,35 @@ SCOPE = [
 ]
 
 
-@st.cache_data(ttl=300)
-def load_data() -> pd.DataFrame:
-    """구글 시트에서 상벌점 데이터 불러오기"""
+def get_gspread_client():
+    """Streamlit secrets의 서비스 계정 정보로 gspread 클라이언트 생성"""
     try:
         creds_info = st.secrets["gcp_service_account"]
     except Exception:
-        st.error("🔐 Streamlit Secrets에 gcp_service_account 설정이 필요해요.")
-        return pd.DataFrame()
+        st.error("🔐 Streamlit Secrets에 [gcp_service_account] 설정이 필요해요.")
+        st.stop()
 
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPE)
     client = gspread.authorize(creds)
+    spreadsheet_id = creds_info["spreadsheet_id"]
 
-    spreadsheet_id = st.secrets["spreadsheet_id"]
-    worksheet_name = st.secrets["worksheet_name"]
+    return client, spreadsheet_id
 
+
+@st.cache_data(ttl=300)
+def list_worksheets():
+    """스프레드시트 안의 워크시트(탭) 목록 가져오기"""
+    client, spreadsheet_id = get_gspread_client()
+    sh = client.open_by_key(spreadsheet_id)
+    sheets = sh.worksheets()
+    # 탭 이름 리스트
+    return [ws.title for ws in sheets]
+
+
+@st.cache_data(ttl=300)
+def load_data(worksheet_name: str) -> pd.DataFrame:
+    """특정 워크시트(탭)의 상벌점 데이터 불러오기"""
+    client, spreadsheet_id = get_gspread_client()
     sh = client.open_by_key(spreadsheet_id)
     ws = sh.worksheet(worksheet_name)
 
@@ -55,6 +69,7 @@ def load_data() -> pd.DataFrame:
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
     df = df.dropna(subset=[DATE_COL]).copy()
 
+    # 월/일/날짜만 컬럼 추가
     df["월"] = df[DATE_COL].dt.month
     df["일"] = df[DATE_COL].dt.day
     df["date_only"] = df[DATE_COL].dt.date
@@ -63,6 +78,7 @@ def load_data() -> pd.DataFrame:
 
 
 def get_display_cols(df: pd.DataFrame):
+    """시트에 실제 존재하는 열만 표시용으로 사용"""
     return [c for c in BASE_DISPLAY_COLS if c in df.columns]
 
 
@@ -70,8 +86,18 @@ def main():
     st.set_page_config("상벌점 대시보드", layout="wide")
     st.title("📚 상벌점 대시보드")
 
-    df = load_data()
+    # 👉 먼저 어떤 탭(월)을 볼지 선택 (예: 1월, 2월, 3월…)
+    sheet_names = list_worksheets()
+    if not sheet_names:
+        st.error("불러올 워크시트가 없습니다. 스프레드시트 탭을 확인해 주세요.")
+        st.stop()
+
+    sel_sheet = st.selectbox("📄 조회할 워크시트(월) 선택", sheet_names)
+    st.caption("※ 예: 1월, 2월, 3월 처럼 월별로 탭을 나눠서 쓰는 경우 해당 탭을 선택하세요.")
+
+    df = load_data(sel_sheet)
     if df.empty:
+        st.warning(f"'{sel_sheet}' 시트에 표시할 데이터가 없어요.")
         st.stop()
 
     col_left, col_right = st.columns(2)
@@ -115,11 +141,12 @@ def main():
         st.subheader("2️⃣ 학급별 오늘 / 이번주 벌점")
 
         today = date.today()
-        week_start = today - timedelta(days=today.weekday())  # 월요일
-        week_end = week_start + timedelta(days=6)              # 일요일
+        week_start = today - timedelta(days=today.weekday())  # 이번 주 월요일
+        week_end = week_start + timedelta(days=6)              # 이번 주 일요일
 
+        # 학년/반 열 체크
         if GRADE_COL not in df.columns or CLASS_COL not in df.columns:
-            st.error(f"'{GRADE_COL}', '{CLASS_COL}' 열이 필요해요.")
+            st.error(f"'{GRADE_COL}', '{CLASS_COL}' 열이 필요해요. 시트 열 이름을 확인해 주세요.")
             st.stop()
 
         grades = sorted(df[GRADE_COL].dropna().unique())
@@ -145,6 +172,7 @@ def main():
 
         col_a, col_b = st.columns(2)
 
+        # 🕒 오늘 벌점
         with col_a:
             st.markdown(f"### 🕒 오늘 벌점 ({today})")
             st.write(f"오늘 벌점 건수: **{len(df_today)}건**")
@@ -166,6 +194,7 @@ def main():
                     use_container_width=True,
                 )
 
+        # 📅 이번주 벌점
         with col_b:
             st.markdown(
                 f"### 📅 이번주 벌점 "
@@ -194,7 +223,7 @@ def main():
     st.caption(
         "✅ 시트 구조(열 이름)가 다르면, 파일 상단에 있는 "
         f"`{DATE_COL}`, `{TIME_COL}`, `{GRADE_COL}`, `{CLASS_COL}` 같은 상수만 "
-        "네 시트에 맞게 수정해줘."
+        "네 시트에 맞게 수정해 줘."
     )
 
 
