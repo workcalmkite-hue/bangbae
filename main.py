@@ -4,7 +4,7 @@ import gspread
 import re
 from google.oauth2.service_account import Credentials
 
-# === 시트 열 이름 (현재 파일 기준) ===
+# === 시트 열 이름 ===
 DATE_COL = "날짜"   # B열
 STU_ID_COL = "학번" # C열
 NAME_COL = "이름"   # D열
@@ -22,7 +22,7 @@ def get_gspread_client():
     try:
         info = st.secrets["gcp_service_account"]
     except Exception:
-        st.error("🔐 secrets.toml 에 [gcp_service_account] 설정이 필요해요.")
+        st.error("🔐 secrets.toml에 [gcp_service_account] 설정이 필요해요.")
         st.stop()
 
     creds = Credentials.from_service_account_info(info, scopes=SCOPE)
@@ -32,10 +32,7 @@ def get_gspread_client():
 
 
 def list_month_sheets():
-    """
-    이름이 'n월' 형태인 탭만 골라서 월 순서대로 정렬해서 반환.
-    예: '3월', '4월', '8월', '11월' ...
-    """
+    """이름이 'n월' 형태인 탭만 월 순서대로 반환"""
     client, spreadsheet_id = get_gspread_client()
     sh = client.open_by_key(spreadsheet_id)
     titles = [ws.title for ws in sh.worksheets()]
@@ -44,47 +41,60 @@ def list_month_sheets():
     for t in titles:
         m = re.match(r"(\d+)월", t.strip())
         if m:
-            month_num = int(m.group(1))
-            month_titles.append((month_num, t))
+            month_titles.append((int(m.group(1)), t))
 
-    # 월 숫자 기준으로 정렬
     month_titles.sort(key=lambda x: x[0])
     return [t for _, t in month_titles]
 
 
-def load_data(worksheet_name: str) -> pd.DataFrame:
+def load_data(sheet_name: str) -> pd.DataFrame:
     """
-    특정 탭의 데이터를 DataFrame으로 읽고,
-    '날짜' 빈칸은 바로 위 날짜로 채워준다(ffill).
+    특정 탭의 데이터를 읽고:
+    - '날짜' 빈칸은 위 날짜로 채움(ffill)
+    - 'day' 컬럼에 일자(숫자)만 추출해서 넣음
     """
     client, spreadsheet_id = get_gspread_client()
     sh = client.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(worksheet_name)
+    ws = sh.worksheet(sheet_name)
 
-    values = ws.get_all_values()  # 헤더 + 데이터 (2차원 리스트)
+    values = ws.get_all_values()
 
-    # 헤더만 있고 데이터가 없으면
     if not values or len(values) == 1:
         return pd.DataFrame()
 
     header = [h.strip() for h in values[0]]
-    data_rows = values[1:]
+    rows = values[1:]
 
-    df = pd.DataFrame(data_rows, columns=header)
+    df = pd.DataFrame(rows, columns=header)
 
     if DATE_COL not in df.columns:
-        st.error(f"'{worksheet_name}' 시트에 '{DATE_COL}' 열이 없습니다. 헤더를 확인해 주세요.")
+        st.error(f"'{sheet_name}' 시트에 '{DATE_COL}' 열이 없습니다.")
         return pd.DataFrame()
 
-    # 🔥 날짜 처리: 빈칸은 바로 위 날짜로 채우기 (엑셀 SCAN/LAMBDA와 같은 효과)
+    # 1) 날짜 빈칸 → 위 날짜로 채우기
     df[DATE_COL] = df[DATE_COL].replace("", pd.NA)
     df[DATE_COL] = df[DATE_COL].ffill()
 
-    # 날짜가 결국 하나도 없으면 빈 df 반환
-    if df[DATE_COL].isna().all():
-        return pd.DataFrame()
+    # 2) 우선 datetime으로 한 번 파싱 시도
+    parsed = pd.to_datetime(df[DATE_COL], errors="coerce")
 
-    # 학번이 비어 있는 요약행/공란행은 제거 (선택사항이지만 깔끔해서 넣음)
+    # 3) 기본 day는 parsed에서 뽑기
+    df["day"] = parsed.dt.day
+
+    # 4) 그래도 day가 NaN인 행은, 문자열에서 숫자만 추출해서 day로 사용
+    mask_na_day = df["day"].isna()
+    if mask_na_day.any():
+        # 문자열 끝부분의 1~2자리 숫자 추출 (예: "4/11", "4월 11일" → "11")
+        extracted = (
+            df.loc[mask_na_day, DATE_COL]
+            .astype(str)
+            .str.extract(r"(\d{1,2})\D*$")[0]
+        )
+        df.loc[mask_na_day, "day"] = pd.to_numeric(extracted, errors="coerce")
+
+    # 5) day가 결국 하나도 없으면, 날짜 기준 필터는 못하지만 df는 반환
+    #    (main에서 다시 체크)
+    # 학번 없는 행은 제거 (요약행/공란행 등)
     if STU_ID_COL in df.columns:
         df = df[df[STU_ID_COL] != ""].copy()
 
@@ -93,55 +103,49 @@ def load_data(worksheet_name: str) -> pd.DataFrame:
 
 def main():
     st.set_page_config("상벌점 대시보드", layout="wide")
-    st.title("📚 상벌점 대시보드 (월·일별 조회)")
+    st.title("📚 상벌점 대시보드 (월 · 일자 조회)")
 
-    # 1) 'n월' 이름을 가진 탭 목록 가져오기
+    # 1) 월 탭 목록
     month_sheets = list_month_sheets()
     if not month_sheets:
-        st.error("이름이 'n월' 형태인 워크시트가 없습니다. 예: '8월', '11월'")
+        st.error("이름이 'n월' 형태인 시트가 없습니다.")
         st.stop()
 
-    # 👉 월, 일을 한 줄에 나란히 선택
-    col_month, col_day = st.columns(2)
+    col1, col2 = st.columns(2)
 
-    with col_month:
+    # ----- 월 선택 -----
+    with col1:
         sel_sheet = st.selectbox("월 선택", month_sheets)
 
-    # 선택한 월(탭)의 데이터 읽기
+    # ----- 시트 데이터 불러오기 -----
     df = load_data(sel_sheet)
     if df.empty:
-        st.warning(f"'{sel_sheet}' 시트에 표시할 데이터가 없어요.")
+        st.warning(f"'{sel_sheet}' 시트에 표시할 데이터가 없습니다.")
         st.stop()
 
-    # 이 월에 실제로 존재하는 날짜 목록 (문자열 그대로 저장)
-    raw_dates = pd.Series(df[DATE_COL].dropna().unique())
+    # day 컬럼이 없는 경우 대비
+    if "day" not in df.columns or df["day"].dropna().empty:
+        st.warning(f"'{sel_sheet}' 시트에서 일자 정보를 찾지 못했습니다.")
+        st.stop()
 
-    # 문자열 날짜를 실제 날짜로 한 번 변환해서 정렬 기준으로 사용
-    date_df = pd.DataFrame({"label": raw_dates})
-    date_df["parsed"] = pd.to_datetime(date_df["label"], errors="coerce")
+    # ----- 일자 목록(숫자) 만들기 -----
+    df["day"] = pd.to_numeric(df["day"], errors="coerce")
+    day_list = sorted(df["day"].dropna().unique())  # 예: [1, 2, 3, ..., 31]
 
-    # parsed(실제 날짜) 기준으로 정렬 (NaT는 맨 뒤)
-    date_df = date_df.sort_values("parsed")
+    with col2:
+        sel_day = st.selectbox("일(일자) 선택", day_list, format_func=lambda d: f"{int(d)}일")
 
-    unique_dates = date_df["label"].tolist()
+    # ----- 선택한 일자의 데이터 필터링 -----
+    df_day = df[df["day"] == sel_day].copy()
 
-    with col_day:
-        sel_date = st.selectbox("일 선택 (해당 월의 날짜)", unique_dates)
-
-    # 선택한 날짜만 필터링
-    df_day = df[df[DATE_COL] == sel_date].copy()
-
-    st.markdown(f"### 📌 {sel_sheet} {sel_date} 벌점 명단")
+    st.markdown(f"### 📌 {sel_sheet} {int(sel_day)}일 벌점 명단")
     st.write(f"총 **{len(df_day)}명**")
 
-    # 표시할 열만 골라서 보여주기
-    display_cols = []
-    for col in [DATE_COL, STU_ID_COL, NAME_COL, ITEM_COL, NOTE_COL]:
-        if col in df_day.columns:
-            display_cols.append(col)
+    display_cols = [DATE_COL, STU_ID_COL, NAME_COL, ITEM_COL, NOTE_COL]
+    display_cols = [c for c in display_cols if c in df_day.columns]
 
     if len(df_day) == 0:
-        st.info("해당 날짜에 기록된 학생이 없습니다.")
+        st.info("해당 날짜에 학생 기록이 없습니다.")
     else:
         st.dataframe(df_day[display_cols], use_container_width=True)
 
