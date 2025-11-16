@@ -7,7 +7,7 @@ from google.oauth2.service_account import Credentials
 
 # ===== 시트 열 이름 설정 =====
 DATE_COL = "날짜"     # B열
-STU_ID_COL = "학번"   # C열 (2414 이런 형식)
+STU_ID_COL = "학번"   # C열 (예: 3106)
 NAME_COL = "이름"     # D열
 ITEM_COL = "사유"     # E열
 NOTE_COL = "비고"     # F열
@@ -16,7 +16,7 @@ NOTE_COL = "비고"     # F열
 GRADE_COL = "학년"
 CLASS_COL = "반"
 
-# 선택적으로 쓸 수 있는 시간대 컬럼 (지금 시트에는 없으니까 그냥 옵션용)
+# 시간대 컬럼(지금은 없지만 나중에 추가 가능)
 TIME_COL = "시간대"
 
 BASE_DISPLAY_COLS = [
@@ -46,7 +46,6 @@ def get_gspread_client():
     return client, spreadsheet_id
 
 
-@st.cache_data(ttl=300)
 def list_worksheets():
     """스프레드시트 안의 모든 워크시트(탭) 이름 가져오기"""
     client, spreadsheet_id = get_gspread_client()
@@ -56,7 +55,6 @@ def list_worksheets():
 
 
 # ===== 데이터 불러오기 =====
-@st.cache_data(ttl=300)
 def load_data(worksheet_name: str) -> pd.DataFrame:
     """
     특정 워크시트(탭)의 상벌점 데이터 불러오기.
@@ -69,17 +67,11 @@ def load_data(worksheet_name: str) -> pd.DataFrame:
     values = ws.get_all_values()  # 2차원 리스트
 
     # 완전 비어 있으면
-    if not values:
-        st.warning(f"'{worksheet_name}' 시트에 데이터가 없습니다.")
+    if not values or len(values) == 1:
         return pd.DataFrame()
 
     header = [h.strip() for h in values[0]]  # 1행 = 헤더
     data_rows = values[1:]                   # 2행부터 = 데이터
-
-    # 1행이 전부 빈칸이면
-    if all(h == "" for h in header):
-        st.warning(f"'{worksheet_name}' 시트의 첫 줄에 열 이름(헤더)이 없습니다.")
-        return pd.DataFrame()
 
     df = pd.DataFrame(data_rows, columns=header)
 
@@ -91,14 +83,20 @@ def load_data(worksheet_name: str) -> pd.DataFrame:
         )
         return pd.DataFrame()
 
-    # 날짜 파싱
+    # ----- 날짜 자동 보정 -----
+    # 빈 문자열을 NaN으로
+    df[DATE_COL] = df[DATE_COL].replace("", pd.NA)
+    # 위 행의 날짜로 채워넣기 (merge된 것처럼 쓴 것 보정)
+    df[DATE_COL] = df[DATE_COL].ffill()
+
+    # 날짜 파싱 (8/20, 2025-08-20 등 웬만한 건 다 먹게)
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
     df = df.dropna(subset=[DATE_COL]).copy()
 
     # 학번 문자열 처리
     df[STU_ID_COL] = df[STU_ID_COL].astype(str).str.strip()
 
-    # 학번에서 학년 / 반 추출 (예: 2414 → 2학년 4반)
+    # 학번에서 학년 / 반 추출 (예: 3106 → 3학년 1반)
     df[GRADE_COL] = df[STU_ID_COL].str[0]
     df[CLASS_COL] = df[STU_ID_COL].str[1]
 
@@ -106,6 +104,9 @@ def load_data(worksheet_name: str) -> pd.DataFrame:
     df["월"] = df[DATE_COL].dt.month
     df["일"] = df[DATE_COL].dt.day
     df["date_only"] = df[DATE_COL].dt.date
+
+    # 완전 빈 행들 정리 (학번이 없는 요약행 등 제거)
+    df = df.dropna(subset=[STU_ID_COL])
 
     return df
 
@@ -232,8 +233,8 @@ def main():
 
     st.markdown("---")
     st.caption(
-        "✅ 모든 월별 탭의 1행에 '날짜, 학번, 이름, 사유, 비고' 헤더가 있어야 해요. "
-        "학번은 '2414'처럼 학년+반+번호 형식이라고 가정했습니다."
+        "✅ 모든 월별 탭의 1행에 '구분, 날짜, 학번, 이름, 사유, 비고' 헤더가 있어야 해요. "
+        "학번은 '3106'처럼 학년+반+번호 형식이라고 가정했습니다."
     )
 
 
